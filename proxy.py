@@ -39,7 +39,13 @@ RESET_COMMANDS = {
 }
 
 JOB_TIMEOUT = 600
-MAX_PROMPT_CHARS = 24000
+# Budget for the whole prompt. Copilot's tool schemas + subagent list alone can
+# run past the old 24000 easily (that's what silently dropped the edit_file
+# tool out of the prompt before) - this only bounds how much conversation
+# history gets kept now (see build_prompt / _truncate_conversation_to_budget),
+# never the tool list or system context, so raise it if you still see
+# conversation getting squeezed to the 2000-char floor in practice.
+MAX_PROMPT_CHARS = 60000
 HISTORY_TAIL = 12
 ARG_CHUNK_SIZE = 24
 AUTO_RESET_THRESHOLD = (
@@ -224,6 +230,28 @@ def _truncate_middle(text: str, limit: int) -> str:
     return text[:keep] + "\n\n[... truncated ...]\n\n" + text[-keep:]
 
 
+def _truncate_conversation_to_budget(conversation: list[str], budget: int) -> list[str]:
+    #Drop OLDEST conversation turns (not characters mid-string) until what's left
+    #fits budget. This is the only part of the prompt allowed to be trimmed for
+    #size - the tool protocol/system context must never be sliced, because a
+    #raw middle-of-string cut can (and did) land inside a tool's JSON schema,
+    #silently hiding whole tools (e.g. an edit_file tool) from the model.
+    if budget <= 0:
+        return []
+    kept: list[str] = []
+    total = 0
+    for turn in reversed(conversation):
+        turn_len = len(turn) + 2  # account for the "\n\n".join separator
+        if kept and total + turn_len > budget:
+            break
+        kept.append(turn)
+        total += turn_len
+    kept.reverse()
+    if len(kept) < len(conversation):
+        kept.insert(0, "[... earlier turns truncated ...]")
+    return kept
+
+
 def _build_tool_list(tools: list[dict]) -> str:
     lines = []
     for tool in tools:
@@ -279,23 +307,43 @@ def build_prompt(
     if len(conversation) > HISTORY_TAIL:
         conversation = conversation[-HISTORY_TAIL:]
 
-    sections: list[str] = []
+    # Tool protocol and system context are load-bearing: a tool the model was
+    # never told about is a tool it can never call, so these are built first
+    # and are exempt from character-budget truncation. Only the conversation
+    # history (already message-capped by HISTORY_TAIL above) gets trimmed
+    # further, and only by dropping whole oldest turns - never by slicing
+    # through the middle of any section's raw text.
+    fixed_sections: list[str] = []
 
     if mode == "native_tools":
-        sections.append(
+        fixed_sections.append(
             TOOL_PROTOCOL_TEMPLATE.format(tool_list=_build_tool_list(tools or []))
         )
     elif mode == "cline_xml":
-        sections.append(CLINE_XML_PROTOCOL)
+        fixed_sections.append(CLINE_XML_PROTOCOL)
 
     if system_parts:
-        sections.append("# System Context\n" + "\n\n".join(system_parts))
+        fixed_sections.append("# System Context\n" + "\n\n".join(system_parts))
 
+    fixed_prompt = "\n\n".join(fixed_sections).strip()
+
+    if fixed_prompt and len(fixed_prompt) >= MAX_PROMPT_CHARS:
+        # The tool list + system context alone already exceed the budget.
+        # Ship them whole regardless (an oversized-but-complete tool list
+        # beats a truncated one with tools silently missing) and give the
+        # conversation section a small fixed floor so the model still has
+        # some recent context to work from.
+        conversation_budget = min(2000, MAX_PROMPT_CHARS // 4)
+    else:
+        conversation_budget = MAX_PROMPT_CHARS - len(fixed_prompt)
+
+    conversation = _truncate_conversation_to_budget(conversation, conversation_budget)
+
+    sections = list(fixed_sections)
     if conversation:
         sections.append("# Conversation\n" + "\n\n".join(conversation))
 
     prompt = "\n\n".join(sections).strip()
-    prompt = _truncate_middle(prompt, MAX_PROMPT_CHARS)
     return prompt, mode
 
 
@@ -331,6 +379,90 @@ _DSML_PARAM_RE = re.compile(
     r"<[|\uFF5C]{2}DSML[|\uFF5C]{2}\s+parameter\s+name=[\"']([^\"']+)[\"'](?:\s+[^>]*)?>(.*?)(?:</[|\uFF5C]{2}DSML[|\uFF5C]{2}\s+parameter>|$)",
     re.DOTALL | re.IGNORECASE,
 )
+# DeepSeek sometimes fuses a parameter's closing tag with the NEXT
+# parameter's opening tag into one hybrid token, e.g.:
+#   ...Core.h</｜｜DSML｜｜ parameter name="isRegexp" string="false">true</｜｜DSML｜｜ parameter name="query" ...
+# i.e. no standalone "</...parameter>" ever appears, so _DSML_PARAM_RE's
+# finditer finds zero matches and the whole block leaks through as text.
+# This generic token scanner matches ANY DSML boundary marker - open, close,
+# or the malformed hybrid of both - and reconstructs calls from the marker
+# sequence rather than requiring cleanly paired open/close tags.
+_DSML_TOKEN_RE = re.compile(
+    r"<(/?)[|\uFF5C]{2}DSML[|\uFF5C]{2}\s*(calls|invoke|parameter)?(?:\s+name=[\"']([^\"']+)[\"'])?[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _coerce_dsml_value(pval: str) -> Any:
+    pval = pval.strip()
+    if pval.lower() == "true":
+        return True
+    if pval.lower() == "false":
+        return False
+    if pval.lower() == "null":
+        return None
+    if pval.isdigit():
+        return int(pval)
+    try:
+        return json.loads(pval)
+    except Exception:
+        return pval
+
+
+def _parse_dsml_tool_calls(raw: str) -> list[dict]:
+    #Reconstructs DSML tool calls from a stream of boundary markers instead of
+    #requiring well-paired open/close tags - tolerates the fused-tag dialect
+    #above as well as the well-formed one.
+    calls: list[dict] = []
+    invoke_name: Optional[str] = None
+    args: dict[str, Any] = {}
+    param_name: Optional[str] = None
+    param_start: Optional[int] = None
+
+    def close_param(end: int) -> None:
+        nonlocal param_name, param_start
+        if param_name is not None and param_start is not None:
+            args[param_name] = _coerce_dsml_value(raw[param_start:end])
+        param_name = None
+        param_start = None
+
+    def close_invoke() -> None:
+        nonlocal invoke_name, args
+        if invoke_name is not None:
+            calls.append({"name": invoke_name, "arguments": args})
+        invoke_name = None
+        args = {}
+
+    for m in _DSML_TOKEN_RE.finditer(raw):
+        is_close = bool(m.group(1))
+        kind = (m.group(2) or "").lower()
+        name = m.group(3)
+
+        if kind == "parameter":
+            close_param(m.start())
+            if name:
+                param_name = name
+                param_start = m.end()
+            continue
+        if kind == "invoke":
+            close_param(m.start())
+            if is_close:
+                close_invoke()
+            elif name:
+                close_invoke()  # defensive: finalize any unterminated prior invoke
+                invoke_name = name
+                args = {}
+            continue
+        if kind == "calls":
+            close_param(m.start())
+            if is_close:
+                close_invoke()
+            continue
+        # Unrecognized DSML token shape - ignore, don't disturb state.
+
+    close_param(len(raw))
+    close_invoke()
+    return calls
 
 # Copilot / other agents sometimes skip the <tool_call> wrapper entirely and
 # emit the tool name itself as the root tag, e.g.:
@@ -581,36 +713,24 @@ def parse_tool_calls(raw: str, tool_names: list[str]) -> list[dict]:
     if direct_calls:
         return _validate_calls(direct_calls, tool_names)
 
-    # DeepSeek Native DSML format:
+    # DeepSeek Native DSML format - well-formed:
     # <｜｜DSML｜｜ calls>
     # <｜｜DSML｜｜ invoke name="TOOL_NAME">
     # <｜｜DSML｜｜ parameter name="PARAM" string="true">VALUE</｜｜DSML｜｜ parameter>
     # </｜｜DSML｜｜ invoke>
     # </｜｜DSML｜｜ calls>
-    for m in _DSML_INVOKE_RE.finditer(raw):
-        name = m.group(1).strip()
-        body = m.group(2)
-        args = {}
-        for pm in _DSML_PARAM_RE.finditer(body):
-            pname = pm.group(1).strip()
-            pval = pm.group(2).strip()
-            if pval.lower() == "true":
-                args[pname] = True
-            elif pval.lower() == "false":
-                args[pname] = False
-            elif pval.lower() == "null":
-                args[pname] = None
-            elif pval.isdigit():
-                args[pname] = int(pval)
-            else:
-                try:
-                    args[pname] = json.loads(pval)
-                except Exception:
-                    args[pname] = pval
-        calls.append({"name": name, "arguments": args})
-
-    if calls:
-        return _validate_calls(calls, tool_names)
+    # ...and the fused/malformed variant where a parameter's close and the
+    # next parameter's open get merged into one hybrid tag. The tolerant
+    # token scanner (_parse_dsml_tool_calls) handles both shapes uniformly -
+    # it's used as the sole DSML parser rather than trying the strict
+    # regex pair first, because that strict pair's own end-of-string
+    # fallback can "successfully" match the malformed case by swallowing
+    # everything after the first parameter into one value, which would
+    # otherwise mask the real per-parameter split done here.
+    if "DSML" in raw:
+        dsml_calls = _parse_dsml_tool_calls(raw)
+        if dsml_calls:
+            return _validate_calls(dsml_calls, tool_names)
     payload = _find_json_in(_strip_fences(raw))
     if isinstance(payload, dict):
         name = payload.get("name") or payload.get("tool") or payload.get("function")
@@ -699,6 +819,10 @@ def _strip_tool_call_artifacts(raw: str, tool_names: list[str]) -> str:
     # Models sometimes double up the closing tag (e.g. "...</tool_call> </tool_call>");
     # the block regex only consumes the first one, so mop up any stragglers.
     text = re.sub(r"</tool_call>", "", text, flags=re.IGNORECASE)
+    # Any leftover DSML boundary markers - including the fused/malformed
+    # tags _DSML_INVOKE_RE/_DSML_PARAM_RE won't match on their own - so a
+    # dropped call doesn't leak raw "｜｜DSML｜｜" markup into the text.
+    text = _DSML_TOKEN_RE.sub("", text)
     for name in tool_names:
         if name in ("tool_call", "arguments", "name"):
             continue
@@ -816,6 +940,18 @@ async def run_browser_job(prompt: str, thinking: bool) -> dict:
         except asyncio.TimeoutError:
             _last_job_time = time.time()
             return {"error": "DeepSeek generation timed out."}
+        except Exception as e:
+            # A page refresh/navigation on the DeepSeek tab can leave `active_ws`
+            # pointing at a half-dead connection for a moment before
+            # websocket_handler's own close detection catches up and clears it -
+            # send_str (or the transport under it) can raise here instead of the
+            # tab cleanly resolving pending_jobs with an error. Without this,
+            # the exception escapes run_browser_job entirely, bypasses the
+            # normal "error" in result handling below, and surfaces to VS Code
+            # as a raw unhandled 500 instead of a readable error message.
+            _last_job_time = time.time()
+            print(f"\033[91m[Bridge]\033[0m run_browser_job send/transport error: {e!r}")
+            return {"error": f"Lost connection to the DeepSeek browser tab: {e}"}
         finally:
             pending_jobs.pop(req_id, None)
 
@@ -876,6 +1012,17 @@ async def stream_browser_job(prompt: str, thinking: bool):
                 else {"error": "No final result received."}
             )
             yield ("final", final_result)
+        except Exception as e:
+            # Same rationale as run_browser_job's except Exception branch: a
+            # DeepSeek tab refresh mid-stream can raise out of send_str/the
+            # transport instead of resolving gracefully, and this generator is
+            # driven directly by _stream_text_reply with no outer try/except -
+            # letting this escape would abort the whole SSE response mid-write
+            # rather than yielding a clean final error the caller already knows
+            # how to render.
+            _last_job_time = time.time()
+            print(f"\033[91m[Bridge]\033[0m stream_browser_job send/transport error: {e!r}")
+            yield ("final", {"error": f"Lost connection to the DeepSeek browser tab: {e}"})
         finally:
             pending_jobs.pop(req_id, None)
             pending_delta_queues.pop(req_id, None)
@@ -1570,8 +1717,32 @@ def normalize_cline_xml(raw: str) -> str:
     return f"<attempt_completion>\n<result>\n{text}\n</result>\n</attempt_completion>"
 
 
+@web.middleware
+async def error_safety_net(request: web.Request, handler):
+    #Last-resort catch-all: turns any exception this app doesn't already
+    #handle gracefully (network races on browser refresh, unexpected
+    #userscript payload shapes, etc.) into a proper OpenAI-style JSON error
+    #instead of letting it become a raw, header-less aiohttp 500 - which is
+    #what VS Code's "Sorry, your request failed... Server error: 500" comes
+    #from. This is a safety net alongside (not instead of) the targeted
+    #fixes in run_browser_job/stream_browser_job, for anything not already
+    #anticipated there.
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise  # deliberate responses (400s, 204 OPTIONS, etc.) pass through
+    except Exception as e:
+        print(f"\033[91m[Bridge]\033[0m Unhandled exception in {request.path}: {e!r}")
+        import traceback
+
+        traceback.print_exc()
+        return error_response(f"Internal proxy error: {e}", 500, "server_error")
+
+
 def make_app() -> web.Application:
-    app = web.Application(client_max_size=64 * 1024 * 1024)
+    app = web.Application(
+        client_max_size=64 * 1024 * 1024, middlewares=[error_safety_net]
+    )
     app.router.add_route("POST", "/v1/chat/completions", handle_chat_completions)
     app.router.add_route("OPTIONS", "/v1/chat/completions", handle_chat_completions)
     app.router.add_route("GET", "/v1/models", handle_models)
