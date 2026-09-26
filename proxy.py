@@ -63,6 +63,15 @@ MODELS = [
 
 active_ws: Optional[web.WebSocketResponse] = None
 pending_jobs: dict[str, asyncio.Future] = {}
+# Optional per-job queue for real-time streaming. A message from the browser
+# with a "delta"/"reasoningDelta" key is routed here instead of resolving the
+# job's future; the existing full-result message (no delta key) still
+# resolves the future as before AND, if a queue is registered, pushes a
+# sentinel (None) so a streaming consumer knows no more deltas are coming.
+# This means an unmodified browser userscript (one that only ever sends the
+# final message) degrades gracefully to "no deltas, just the final result" -
+# nothing breaks if the userscript side isn't updated.
+pending_delta_queues: dict[str, asyncio.Queue] = {}
 _job_lock: Optional[asyncio.Lock] = None
 
 # Tracks consecutive turns where every parsed tool call was dropped for
@@ -155,9 +164,16 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                     )
                     continue
                 req_id = data.get("id")
+                queue = pending_delta_queues.get(req_id) if req_id else None
+                if "delta" in data or "reasoningDelta" in data:
+                    if queue is not None:
+                        queue.put_nowait(data)
+                    continue
                 future = pending_jobs.get(req_id) if req_id else None
                 if future and not future.done():
                     future.set_result(data)
+                if queue is not None:
+                    queue.put_nowait(None)  # sentinel: final result is ready
             elif msg.type in (web.WSMsgType.CLOSED, web.WSMsgType.ERROR):
                 break
     finally:
@@ -166,6 +182,8 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         for fut in list(pending_jobs.values()):
             if not fut.done():
                 fut.set_result({"error": "Browser tab disconnected mid-request."})
+        for queue in list(pending_delta_queues.values()):
+            queue.put_nowait(None)
         print("\033[93m[Bridge]\033[0m DeepSeek browser tab disconnected.")
 
     return ws
@@ -767,6 +785,67 @@ async def run_browser_job(prompt: str, thinking: bool) -> dict:
             pending_jobs.pop(req_id, None)
 
 
+async def stream_browser_job(prompt: str, thinking: bool):
+    #Async generator: yields ("delta", data) as partial text/reasoning
+    #arrives, then a final ("final", result_dict). If the browser userscript
+    #doesn't send delta messages, this degrades to a single ("final", ...)
+    #yield with no deltas in between - same effective behavior as
+    #run_browser_job, just through the same code path callers can rely on.
+    global _last_job_time
+    async with job_lock():
+        if not active_ws or active_ws.closed:
+            yield ("final", {"error": "DeepSeek browser tab is not connected."})
+            return
+
+        now = time.time()
+        elapsed = now - _last_job_time
+        if elapsed < MIN_JOB_INTERVAL:
+            await asyncio.sleep(MIN_JOB_INTERVAL - elapsed)
+
+        req_id = f"{int(time.time())}-{uuid.uuid4().hex[:6]}"
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        queue: asyncio.Queue = asyncio.Queue()
+        pending_jobs[req_id] = future
+        pending_delta_queues[req_id] = queue
+
+        try:
+            await active_ws.send_str(
+                json.dumps(
+                    {
+                        "id": req_id,
+                        "prompt": prompt,
+                        "thinkingEnabled": bool(thinking),
+                    }
+                )
+            )
+            deadline = time.time() + JOB_TIMEOUT
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    yield ("final", {"error": "DeepSeek generation timed out."})
+                    return
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    yield ("final", {"error": "DeepSeek generation timed out."})
+                    return
+                if item is None:
+                    break  # sentinel: the final result is ready on the future
+                yield ("delta", item)
+
+            _last_job_time = time.time()
+            final_result = (
+                future.result()
+                if future.done()
+                else {"error": "No final result received."}
+            )
+            yield ("final", final_result)
+        finally:
+            pending_jobs.pop(req_id, None)
+            pending_delta_queues.pop(req_id, None)
+
+
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -885,6 +964,128 @@ _last_turn_was_final: bool = False
 def _looks_like_continuation_stub(text: str) -> bool:
     stripped = text.strip()
     return (not stripped) or bool(CONTINUATION_STUB_RE.match(stripped))
+
+
+async def _stream_text_reply(
+    request: web.Request,
+    model: str,
+    prompt: str,
+    is_reasoner: bool,
+    completion_id: str,
+    created: int,
+    include_usage: bool,
+) -> web.Response:
+    #Forward reasoning/content deltas live via SSE as DeepSeek generates them.
+    #Degrades gracefully to a single chunked dump of the full text if the
+    #browser userscript never sends delta messages (same end result as the
+    #old post-hoc chunking, just reached through this path instead).
+    global _last_turn_was_final
+
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            **CORS_HEADERS,
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await response.prepare(request)
+
+    first = True
+    got_any_delta = False
+    streamed_parts: list[str] = []
+    final_result: dict = {}
+
+    async for kind, item in stream_browser_job(prompt, is_reasoner):
+        if kind == "delta":
+            got_any_delta = True
+            reasoning_delta = item.get("reasoningDelta")
+            text_delta = item.get("delta")
+            if reasoning_delta:
+                delta = {"reasoning_content": reasoning_delta}
+                if first:
+                    delta["role"] = "assistant"
+                    first = False
+                await sse_write(response, chunk(completion_id, created, model, delta))
+            if text_delta:
+                streamed_parts.append(text_delta)
+                delta = {"content": text_delta}
+                if first:
+                    delta["role"] = "assistant"
+                    first = False
+                await sse_write(response, chunk(completion_id, created, model, delta))
+        else:
+            final_result = item
+
+    if "error" in final_result:
+        # SSE headers are already sent, so we can't fall back to a JSON error
+        # response - surface it as a final content chunk instead.
+        err_text = f"\n\n[proxy error: {final_result['error']}]"
+        delta = {"content": err_text}
+        if first:
+            delta["role"] = "assistant"
+            first = False
+        await sse_write(response, chunk(completion_id, created, model, delta))
+        await sse_write(response, chunk(completion_id, created, model, {}, "stop"))
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    full_text = (final_result.get("text") or "".join(streamed_parts)).strip()
+    reasoning = (final_result.get("reasoning") or "").strip()
+
+    if not got_any_delta and full_text:
+        # Legacy userscript: nothing streamed live, so fall back to chunking
+        # the complete result exactly as the old code path did.
+        for fragment in iter_text_fragments(reasoning, size=64):
+            d = {"reasoning_content": fragment}
+            if first:
+                d["role"] = "assistant"
+                first = False
+            await sse_write(response, chunk(completion_id, created, model, d))
+        for fragment in iter_text_fragments(_ensure_code_fenced(full_text), size=64):
+            d = {"content": fragment}
+            if first:
+                d["role"] = "assistant"
+                first = False
+            await sse_write(response, chunk(completion_id, created, model, d))
+
+    if first:
+        await sse_write(
+            response,
+            chunk(completion_id, created, model, {"role": "assistant", "content": ""}),
+        )
+
+    _last_turn_was_final = bool(full_text and COMPLETION_SIGNAL_RE.search(full_text))
+
+    await sse_write(response, chunk(completion_id, created, model, {}, "stop"))
+
+    accumulated_tokens = int(final_result.get("accumulatedTokens") or 0)
+    initial_tokens = int(final_result.get("initialTokens") or 0)
+
+    if include_usage:
+        usage = usage_payload(prompt, full_text, accumulated_tokens, initial_tokens)
+        await sse_write(
+            response,
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            },
+        )
+
+    if AUTO_RESET_THRESHOLD > 0 and accumulated_tokens >= AUTO_RESET_THRESHOLD:
+        asyncio.create_task(_trigger_browser_reset())
+
+    await response.write(b"data: [DONE]\n\n")
+    await response.write_eof()
+    return response
 
 
 async def handle_chat_completions(request: web.Request) -> web.Response:
@@ -1022,6 +1223,18 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         f"\033[96m[Request]\033[0m model={model} stream={stream} "
         f"mode={mode} tools={len(tool_names)} reasoner={is_reasoner} cline={is_cline}"
     )
+
+    if stream and mode == "text":
+        # No tools in play, so there's no "is this a tool call?" ambiguity to
+        # resolve first - safe to forward text as DeepSeek generates it
+        # instead of waiting for the full reply and chunking it after the
+        # fact. Falls back gracefully to the old "chunk the whole thing"
+        # behavior if the browser userscript doesn't send delta messages.
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        return await _stream_text_reply(
+            request, model, prompt, is_reasoner, completion_id, created, include_usage
+        )
 
     result = await run_browser_job(prompt, is_reasoner)
 
