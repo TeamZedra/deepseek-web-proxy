@@ -65,6 +65,13 @@ active_ws: Optional[web.WebSocketResponse] = None
 pending_jobs: dict[str, asyncio.Future] = {}
 _job_lock: Optional[asyncio.Lock] = None
 
+# Tracks consecutive turns where every parsed tool call was dropped for
+# missing required arguments (see missing_required_args). Used to detect
+# and break the "model keeps emitting {} and the agent keeps re-prompting
+# forever" loop, since neither side ever gets a signal to stop on its own.
+_consecutive_invalid_tool_turns: int = 0
+INVALID_TOOL_LOOP_THRESHOLD = 2  # force a hard-stop message after this many in a row
+
 
 def job_lock() -> asyncio.Lock:
     #Lazily create the lock so import works without a running loop.
@@ -634,6 +641,21 @@ def missing_required_args(arguments: dict, tool_schema: Optional[dict]) -> list[
     return [key for key in required if key not in arguments]
 
 
+def _strip_tool_call_artifacts(raw: str, tool_names: list[str]) -> str:
+    #Remove leftover tool-call XML (any of the three formats we parse) so a
+    #dropped/invalid call doesn't leak raw markup into a text fallback.
+    text = _TOOL_CALL_BLOCK_RE.sub("", raw)
+    text = _DSML_INVOKE_RE.sub("", text)
+    for name in tool_names:
+        if name in ("tool_call", "arguments", "name"):
+            continue
+        safe_name = re.escape(name)
+        text = re.sub(
+            rf"<{safe_name}>.*?</{safe_name}>", "", text, flags=re.DOTALL | re.IGNORECASE
+        )
+    return text.strip()
+
+
 def chunk(
     completion_id: str,
     created: int,
@@ -792,6 +814,79 @@ def _is_cline_request(
     return False
 
 
+async def _simple_text_response(
+    request: web.Request, model: str, stream: bool, reply_text: str
+) -> web.Response:
+    #Build a short, definitive assistant reply with no tool_calls, bypassing
+    #the browser entirely. Used for slash-commands and for short-circuiting
+    #agent auto-continuation stubs (see CONTINUATION_STUB_RE).
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+
+    if not stream:
+        return web.json_response(
+            {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": reply_text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": usage_payload("", reply_text),
+            },
+            headers=CORS_HEADERS,
+        )
+
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            **CORS_HEADERS,
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+        },
+    )
+    await response.prepare(request)
+    await sse_write(
+        response,
+        chunk(completion_id, created, model, {"role": "assistant", "content": reply_text}),
+    )
+    await sse_write(response, chunk(completion_id, created, model, {}, "stop"))
+    await response.write(b"data: [DONE]\n\n")
+    await response.write_eof()
+    return response
+
+
+# Agent harnesses (VS Code Copilot Agent Mode among them) sometimes keep a
+# task "alive" by sending a synthetic follow-up turn that looks like a user
+# message but isn't one - e.g. "Continue.", "Continue to iterate?", "Proceed."
+# with no real new instruction. If the model already signaled it was done
+# last turn, forwarding one of these stubs to DeepSeek just invites another
+# round of self-directed "work" and the loop never actually ends. We detect
+# both sides of that pattern and refuse to continue, forcing a genuine stop.
+CONTINUATION_STUB_RE = re.compile(
+    r"^(continue\.?|continue to iterate\??|proceed\.?|go ahead\.?|keep going\.?|next\.?)$",
+    re.IGNORECASE,
+)
+COMPLETION_SIGNAL_RE = re.compile(
+    r"\b(task is complete|all done|nothing (else|more) to do|"
+    r"i'?ve finished|completed successfully|that completes the|"
+    r"no further (action|steps?) (is |are )?needed)\b",
+    re.IGNORECASE,
+)
+_last_turn_was_final: bool = False
+
+
+def _looks_like_continuation_stub(text: str) -> bool:
+    stripped = text.strip()
+    return (not stripped) or bool(CONTINUATION_STUB_RE.match(stripped))
+
+
 async def handle_chat_completions(request: web.Request) -> web.Response:
     if request.method == "OPTIONS":
         return web.Response(status=204, headers=CORS_HEADERS)
@@ -814,7 +909,21 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             last_user_text = _message_text(m).strip()
             break
 
+    global _last_turn_was_final
+    if _last_turn_was_final and _looks_like_continuation_stub(last_user_text):
+        print(
+            f"\033[93m[Loop-Guard]\033[0m Refusing auto-continuation stub "
+            f"{last_user_text!r} after a completed turn."
+        )
+        return await _simple_text_response(
+            request,
+            model,
+            stream,
+            "This task is already complete - standing by for your next instruction.",
+        )
+
     if last_user_text.lower() in RESET_COMMANDS:
+        _last_turn_was_final = False
         print(f"\033[93m[Command]\033[0m Reset chat triggered: {last_user_text}")
         async with job_lock():
             if active_ws and not active_ws.closed:
@@ -994,6 +1103,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         content = normalize_cline_xml(raw_text)
     else:
         content = _ensure_code_fenced(raw_text)
+
+    _last_turn_was_final = bool(
+        not tool_calls and content and COMPLETION_SIGNAL_RE.search(content)
+    )
 
     print(
         f"\033[92m[Success]\033[0m mode={mode} "

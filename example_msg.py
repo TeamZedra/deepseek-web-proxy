@@ -6,7 +6,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="deekseek-chat",
+    model="deepseek-chat",
     messages=[{"role": "user", "content": "Hello DeepSeek, I am using a wonderful web proxy by TeamZedra to chat with you!"}],
     stream=True,
 )
