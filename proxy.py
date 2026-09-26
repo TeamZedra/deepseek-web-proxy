@@ -300,7 +300,20 @@ def build_prompt(
 
 
 _TOOL_CALL_BLOCK_RE = re.compile(
-    r"<tool_call>(.*?)(?:</tool_call>|</[|\uFF5C]{2}DSML[|\uFF5C]{2}\s*(?:calls|invoke|parameter)>|(?=<tool_call>)|$)",
+    r"<tool_call((?:\s+[^>]*)?)>(.*?)(?:</tool_call>|</[|\uFF5C]{2}DSML[|\uFF5C]{2}\s*(?:calls|invoke|parameter)>|(?=<tool_call(?:\s|>))|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+# Attribute-style dialect some models (and Claude-family harnesses) fall back
+# to instead of the <n>/<arguments> form we ask for:
+#   <tool_call name="TOOL_NAME">
+#     <parameter name="PARAM">VALUE</parameter>
+#     ...
+#   </tool_call>
+_TOOL_CALL_NAME_ATTR_RE = re.compile(
+    r"\bname=[\"']([^\"']+)[\"']", re.IGNORECASE
+)
+_PARAMETER_TAG_RE = re.compile(
+    r"<parameter\s+name=[\"']([^\"']+)[\"'][^>]*>(.*?)</parameter>",
     re.DOTALL | re.IGNORECASE,
 )
 _TAG_NAME_RE = re.compile(r"<name>(.*?)</name>", re.DOTALL | re.IGNORECASE)
@@ -501,8 +514,27 @@ def parse_tool_calls(raw: str, tool_names: list[str]) -> list[dict]:
 
     calls: list[dict] = []
 
-    for block in _TOOL_CALL_BLOCK_RE.findall(raw):
+    for open_attrs, block in _TOOL_CALL_BLOCK_RE.findall(raw):
         block = block.strip()
+        if not block and not open_attrs:
+            continue
+
+        # Attribute-style dialect: <tool_call name="X"><parameter name="Y">Z</parameter></tool_call>
+        attr_name_match = _TOOL_CALL_NAME_ATTR_RE.search(open_attrs) if open_attrs else None
+        param_matches = _PARAMETER_TAG_RE.findall(block) if block else []
+        if attr_name_match and param_matches:
+            name = attr_name_match.group(1).strip()
+            arguments = {}
+            for pname, pval in param_matches:
+                pval = pval.strip()
+                if pval.startswith("\n"):
+                    pval = pval[1:]
+                if pval.endswith("\n"):
+                    pval = pval[:-1]
+                arguments[pname.strip()] = pval
+            calls.append({"name": name, "arguments": arguments})
+            continue
+
         if not block:
             continue
         name_match = _TAG_NAME_RE.search(block)
@@ -664,6 +696,9 @@ def _strip_tool_call_artifacts(raw: str, tool_names: list[str]) -> str:
     #dropped/invalid call doesn't leak raw markup into a text fallback.
     text = _TOOL_CALL_BLOCK_RE.sub("", raw)
     text = _DSML_INVOKE_RE.sub("", text)
+    # Models sometimes double up the closing tag (e.g. "...</tool_call> </tool_call>");
+    # the block regex only consumes the first one, so mop up any stragglers.
+    text = re.sub(r"</tool_call>", "", text, flags=re.IGNORECASE)
     for name in tool_names:
         if name in ("tool_call", "arguments", "name"):
             continue
@@ -1257,7 +1292,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             f"\033[93m[Debug]\033[0m parse_tool_calls: found={len(parsed)} "
             f"names={[c['name'] for c in parsed]} valid_names={tool_names}"
         )
-        if ("<tool_call>" in raw_text or "DSML" in raw_text) and not parsed:
+        if ("<tool_call" in raw_text or "DSML" in raw_text) and not parsed:
             print(
                 f"\033[91m[Debug-ParseError]\033[0m tool tag found but failed to parse: {repr(raw_text[:600])}"
             )
