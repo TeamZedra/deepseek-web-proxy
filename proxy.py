@@ -620,6 +620,20 @@ def coerce_arguments(arguments: dict, tool_schema: Optional[dict]) -> dict:
     return arguments
 
 
+def missing_required_args(arguments: dict, tool_schema: Optional[dict]) -> list[str]:
+    #Return the required schema keys that arguments still lacks after coercion.
+    #This is what catches the "model emits <tool_call> with {} arguments"
+    #failure mode: rather than shipping a call we already know is invalid and
+    #letting the client bounce it back for the model to blindly retry, we
+    #catch it here and fall back to plain text in the same turn.
+    if not tool_schema:
+        return []
+    required = tool_schema.get("required") or []
+    if not isinstance(arguments, dict):
+        return list(required)
+    return [key for key in required if key not in arguments]
+
+
 def chunk(
     completion_id: str,
     created: int,
@@ -931,18 +945,38 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             )
 
         if parsed:
-            for index, call in enumerate(parsed):
+            dropped: list[str] = []
+            for call in parsed:
                 arguments = coerce_arguments(
                     call["arguments"], tool_schemas.get(call["name"])
                 )
+                missing = missing_required_args(
+                    arguments, tool_schemas.get(call["name"])
+                )
+                if missing:
+                    dropped.append(f"{call['name']} (missing: {', '.join(missing)})")
+                    continue
                 tool_calls.append(
                     {
                         "id": f"call_{uuid.uuid4().hex[:24]}",
-                        "index": index,
+                        "index": len(tool_calls),
                         "name": call["name"],
                         "arguments": arguments,
                     }
                 )
+            if dropped:
+                print(
+                    f"\033[91m[Debug-InvalidArgs]\033[0m dropped incomplete tool call(s): "
+                    f"{'; '.join(dropped)}"
+                )
+            if not tool_calls:
+                # Every parsed call was missing required arguments (e.g. the
+                # model emitted "{}"). Shipping any of these guarantees a
+                # client-side error and invites the model to blindly retry
+                # the same broken call. Deliver the raw text instead so the
+                # turn isn't wasted, and the model gets a fresh chance next
+                # message rather than repeating the same empty-args call.
+                content = _ensure_code_fenced(raw_text)
         elif "attempt_completion" in tool_names:
             tool_calls.append(
                 {
