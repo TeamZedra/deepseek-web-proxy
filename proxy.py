@@ -294,6 +294,47 @@ _DSML_PARAM_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Copilot / other agents sometimes skip the <tool_call> wrapper entirely and
+# emit the tool name itself as the root tag, e.g.:
+#   <create_file>
+#     <filePath>...</filePath>
+#     <content>...</content>
+#   </create_file>
+_CHILD_TAG_RE = re.compile(r"<([a-zA-Z_][\w-]*)>(.*?)</\1>", re.DOTALL)
+
+
+def _parse_direct_xml_tool_calls(raw: str, tool_names: list[str]) -> list[dict]:
+    #Parse <tool_name><param>val</param>...</tool_name> blocks, one root tag per known tool.
+    if not raw or not tool_names:
+        return []
+
+    calls: list[dict] = []
+    for name in tool_names:
+        if name in ("tool_call", "arguments", "name"):
+            continue
+        safe_name = re.escape(name)
+        block_re = re.compile(
+            rf"<{safe_name}>(.*?)</{safe_name}>", re.DOTALL | re.IGNORECASE
+        )
+        for block_match in block_re.finditer(raw):
+            body = block_match.group(1)
+            arguments: dict[str, Any] = {}
+            for child_match in _CHILD_TAG_RE.finditer(body):
+                key = child_match.group(1).strip()
+                val = child_match.group(2)
+                # Strip exactly one leading/trailing newline (formatting
+                # artifact) but preserve internal whitespace/content, e.g.
+                # a file's actual contents.
+                if val.startswith("\n"):
+                    val = val[1:]
+                if val.endswith("\n"):
+                    val = val[:-1]
+                arguments[key] = val
+            if arguments:
+                calls.append({"name": name, "arguments": arguments})
+
+    return calls
+
 
 def _strip_fences(text: str) -> str:
     return _FENCE_RE.sub("", text).strip()
@@ -476,6 +517,12 @@ def parse_tool_calls(raw: str, tool_names: list[str]) -> list[dict]:
 
     if calls:
         return _validate_calls(calls, tool_names)
+
+    # Copilot-style direct XML: <tool_name><param>val</param></tool_name>
+    # with no <tool_call> wrapper at all.
+    direct_calls = _parse_direct_xml_tool_calls(raw, tool_names)
+    if direct_calls:
+        return _validate_calls(direct_calls, tool_names)
 
     # DeepSeek Native DSML format:
     # <｜｜DSML｜｜ calls>
