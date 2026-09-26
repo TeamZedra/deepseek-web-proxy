@@ -205,6 +205,24 @@
       this.initialTokenUsage = 0;
       this.messageId = null;
       this.sessionId = null;
+      // Set by the caller to stream partial text out over the websocket as
+      // it arrives, instead of only delivering the full result at the end.
+      // Called as onDelta(text, isThinking).
+      this.onDelta = null;
+    }
+
+    // Only RESPONSE (or untyped, which defaults to RESPONSE) and THINKING
+    // fragments are streamed live - this mirrors exactly what getResult()
+    // includes in `text` vs `reasoning`, so other fragment types (search
+    // results, references, etc.) never leak into the live stream either.
+    emitDelta(idx, str) {
+      if (!this.onDelta || !str) return;
+      const type = (this.fragments[idx] && this.fragments[idx].type) || "RESPONSE";
+      if (type === "RESPONSE") {
+        this.onDelta(str, false);
+      } else if (type === "THINKING") {
+        this.onDelta(str, true);
+      }
     }
 
     touch(idx, str) {
@@ -214,6 +232,7 @@
       }
       this.fragments[idx].content += str;
       if (idx > this.lastFragIdx) this.lastFragIdx = idx;
+      this.emitDelta(idx, str);
     }
 
     feed(chunk) {
@@ -333,11 +352,19 @@
         frags.forEach((f, i) => {
           const incomingContent = f.content || "";
           const existingContent = (this.fragments[i] && this.fragments[i].content) || "";
+          const grew = incomingContent.length >= existingContent.length;
+          const newContent = grew ? incomingContent : existingContent;
           this.fragments[i] = {
             type: f.type || "RESPONSE",
-            content: incomingContent.length >= existingContent.length ? incomingContent : existingContent,
+            content: newContent,
           };
           if (i > this.lastFragIdx) this.lastFragIdx = i;
+          // This event sometimes resends the whole cumulative content
+          // rather than just the new piece, so only stream the delta -
+          // whatever was appended since we last saw this fragment.
+          if (grew && newContent.length > existingContent.length) {
+            this.emitDelta(i, newContent.slice(existingContent.length));
+          }
         });
         return false;
       }
@@ -360,11 +387,13 @@
         p.p.includes("fragments")
       ) {
         const newIdx = this.lastFragIdx + 1;
+        const initialContent = p.v.content || "";
         this.fragments[newIdx] = {
           type: p.v.type || "RESPONSE",
-          content: p.v.content || "",
+          content: initialContent,
         };
         this.lastFragIdx = newIdx;
+        this.emitDelta(newIdx, initialContent);
         return false;
       }
 
@@ -722,6 +751,19 @@
       updateBadge("busy", "Bridge: Generating...");
 
       const parser = new SSEParser();
+      parser.onDelta = (text, isThinking) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        try {
+          ws.send(
+            JSON.stringify(
+              isThinking ? { id, reasoningDelta: text } : { id, delta: text }
+            )
+          );
+        } catch (e) {
+          // Best-effort only - if this fails the proxy just falls back to
+          // waiting for the final result, same as before this existed.
+        }
+      };
       let timeoutId;
 
       const capture = {
