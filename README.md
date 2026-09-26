@@ -2,7 +2,7 @@
 
 >by [TeamZedra](https://github.com/TeamZedra)
 
-[image](server-ss.png)
+![image](server-ss.png)
 
 Run a local OpenAI-compatible API bridge using your logged-in browser tab on [chat.deepseek.com](https://chat.deepseek.com).
 
